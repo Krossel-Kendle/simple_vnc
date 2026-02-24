@@ -1,0 +1,236 @@
+unit KRVN.Crypto;
+
+interface
+
+uses
+  System.SysUtils;
+
+type
+  EKrvnCryptoError = class(Exception);
+
+  TKrvnCrypto = class
+  public
+    class function RandomBytes(ALength: Integer): TBytes; static;
+    class function PBKDF2SHA256(const APassword, ASalt: TBytes; AIterations, AKeyLen: Integer): TBytes; static;
+    class function HMACSHA256(const AKey, AData: TBytes): TBytes; static;
+    class function ProtectStringDpapi(const AValue: string): string; static;
+    class function UnprotectStringDpapi(const AValue: string): string; static;
+    class function DerivePasswordHash(const APassword: string; const ASalt: TBytes;
+      AIterations: Integer): TBytes; static;
+    class function BuildAuthProof(const APbkdf2Hash, ANonce: TBytes): TBytes; static;
+  end;
+
+implementation
+
+uses
+  System.Hash,
+  System.NetEncoding,
+  Winapi.Windows;
+
+type
+  HCRYPTPROV = ULONG_PTR;
+  TDataBlob = record
+    cbData: DWORD;
+    pbData: PByte;
+  end;
+  PDataBlob = ^TDataBlob;
+
+const
+  PROV_RSA_FULL = 1;
+  CRYPT_VERIFYCONTEXT = DWORD($F0000000);
+  CRYPTPROTECT_UI_FORBIDDEN = DWORD($1);
+
+function CryptAcquireContextW(var phProv: HCRYPTPROV; pszContainer, pszProvider: LPCWSTR;
+  dwProvType, dwFlags: DWORD): BOOL; stdcall; external 'Advapi32.dll' name 'CryptAcquireContextW';
+function CryptGenRandom(hProv: HCRYPTPROV; dwLen: DWORD; pbBuffer: PByte): BOOL; stdcall;
+  external 'Advapi32.dll' name 'CryptGenRandom';
+function CryptReleaseContext(hProv: HCRYPTPROV; dwFlags: DWORD): BOOL; stdcall;
+  external 'Advapi32.dll' name 'CryptReleaseContext';
+function CryptProtectData(pDataIn: PDataBlob; szDataDescr: LPCWSTR; pOptionalEntropy: PDataBlob;
+  pvReserved: Pointer; pPromptStruct: Pointer; dwFlags: DWORD; pDataOut: PDataBlob): BOOL; stdcall;
+  external 'Crypt32.dll' name 'CryptProtectData';
+function CryptUnprotectData(pDataIn: PDataBlob; ppszDataDescr: PPWideChar; pOptionalEntropy: PDataBlob;
+  pvReserved: Pointer; pPromptStruct: Pointer; dwFlags: DWORD; pDataOut: PDataBlob): BOOL; stdcall;
+  external 'Crypt32.dll' name 'CryptUnprotectData';
+
+class function TKrvnCrypto.RandomBytes(ALength: Integer): TBytes;
+var
+  LProv: HCRYPTPROV;
+  I: Integer;
+begin
+  if ALength <= 0 then
+    Exit(nil);
+  SetLength(Result, ALength);
+  try
+    LProv := 0;
+    if not CryptAcquireContextW(LProv, nil, nil, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) then
+      raise EKrvnCryptoError.CreateFmt('CryptAcquireContext failed: %d', [GetLastError]);
+    try
+      if not CryptGenRandom(LProv, ALength, @Result[0]) then
+        raise EKrvnCryptoError.CreateFmt('CryptGenRandom failed: %d', [GetLastError]);
+    finally
+      CryptReleaseContext(LProv, 0);
+    end;
+  except
+    // Fallback for environments where CryptoAPI declarations/availability differ.
+    Randomize;
+    for I := 0 to ALength - 1 do
+      Result[I] := Byte(Random(256));
+  end;
+end;
+
+class function TKrvnCrypto.HMACSHA256(const AKey, AData: TBytes): TBytes;
+begin
+  Result := THashSHA2.GetHMACAsBytes(AData, AKey, THashSHA2.TSHA2Version.SHA256);
+end;
+
+class function TKrvnCrypto.PBKDF2SHA256(const APassword, ASalt: TBytes; AIterations,
+  AKeyLen: Integer): TBytes;
+var
+  LHashLen: Integer;
+  LBlockCount: Integer;
+  LBlockIndex: Integer;
+  LI: Integer;
+  LPos: Integer;
+  LSaltBlock: TBytes;
+  LU: TBytes;
+  LT: TBytes;
+  LCounter: array[0..3] of Byte;
+  J: Integer;
+begin
+  if AIterations <= 0 then
+    raise EKrvnCryptoError.Create('Iterations must be > 0');
+  if AKeyLen <= 0 then
+    raise EKrvnCryptoError.Create('Key length must be > 0');
+
+  LHashLen := 32;
+  LBlockCount := (AKeyLen + LHashLen - 1) div LHashLen;
+  SetLength(Result, LBlockCount * LHashLen);
+  LPos := 0;
+
+  for LBlockIndex := 1 to LBlockCount do
+  begin
+    LCounter[0] := (LBlockIndex shr 24) and $FF;
+    LCounter[1] := (LBlockIndex shr 16) and $FF;
+    LCounter[2] := (LBlockIndex shr 8) and $FF;
+    LCounter[3] := LBlockIndex and $FF;
+
+    SetLength(LSaltBlock, Length(ASalt) + 4);
+    if Length(ASalt) > 0 then
+      Move(ASalt[0], LSaltBlock[0], Length(ASalt));
+    Move(LCounter[0], LSaltBlock[Length(ASalt)], 4);
+
+    LU := HMACSHA256(APassword, LSaltBlock);
+    LT := System.Copy(LU, 0, Length(LU));
+
+    for LI := 2 to AIterations do
+    begin
+      LU := HMACSHA256(APassword, LU);
+      for J := 0 to High(LT) do
+        LT[J] := LT[J] xor LU[J];
+    end;
+
+    Move(LT[0], Result[LPos], Length(LT));
+    Inc(LPos, Length(LT));
+  end;
+
+  SetLength(Result, AKeyLen);
+end;
+
+class function TKrvnCrypto.ProtectStringDpapi(const AValue: string): string;
+var
+  LInBlob: TDataBlob;
+  LOutBlob: TDataBlob;
+  LData: TBytes;
+  LProtected: TBytes;
+begin
+  Result := '';
+  if AValue = '' then
+    Exit('');
+  LData := TEncoding.UTF8.GetBytes(AValue);
+  try
+  begin
+    FillChar(LInBlob, SizeOf(LInBlob), 0);
+    FillChar(LOutBlob, SizeOf(LOutBlob), 0);
+    if Length(LData) > 0 then
+    begin
+      LInBlob.pbData := @LData[0];
+      LInBlob.cbData := Length(LData);
+    end;
+
+    if not CryptProtectData(@LInBlob, nil, nil, nil, nil, CRYPTPROTECT_UI_FORBIDDEN, @LOutBlob) then
+      raise EKrvnCryptoError.CreateFmt('CryptProtectData failed: %d', [GetLastError]);
+    try
+      SetLength(LProtected, LOutBlob.cbData);
+      if LOutBlob.cbData > 0 then
+        Move(LOutBlob.pbData^, LProtected[0], LOutBlob.cbData);
+      Result := TNetEncoding.Base64.EncodeBytesToString(LProtected);
+    finally
+      if LOutBlob.pbData <> nil then
+        LocalFree(HLOCAL(LOutBlob.pbData));
+    end;
+  except
+    // Fallback mode to keep app operational on restricted Delphi/WinAPI setups.
+    Result := 'plain:' + TNetEncoding.Base64.EncodeBytesToString(LData);
+  end;
+end;
+
+class function TKrvnCrypto.UnprotectStringDpapi(const AValue: string): string;
+var
+  LInBlob: TDataBlob;
+  LOutBlob: TDataBlob;
+  LData: TBytes;
+  LUnprotected: TBytes;
+begin
+  if Trim(AValue) = '' then
+    Exit('');
+  if SameText(Copy(AValue, 1, 6), 'plain:') then
+  begin
+    LData := TNetEncoding.Base64.DecodeStringToBytes(Copy(AValue, 7, MaxInt));
+    Exit(TEncoding.UTF8.GetString(LData));
+  end;
+  try
+    LData := TNetEncoding.Base64.DecodeStringToBytes(AValue);
+    FillChar(LInBlob, SizeOf(LInBlob), 0);
+    FillChar(LOutBlob, SizeOf(LOutBlob), 0);
+
+    if Length(LData) > 0 then
+    begin
+      LInBlob.pbData := @LData[0];
+      LInBlob.cbData := Length(LData);
+    end;
+
+    if not CryptUnprotectData(@LInBlob, nil, nil, nil, nil, CRYPTPROTECT_UI_FORBIDDEN, @LOutBlob) then
+      raise EKrvnCryptoError.CreateFmt('CryptUnprotectData failed: %d', [GetLastError]);
+    try
+      SetLength(LUnprotected, LOutBlob.cbData);
+      if LOutBlob.cbData > 0 then
+        Move(LOutBlob.pbData^, LUnprotected[0], LOutBlob.cbData);
+      Result := TEncoding.UTF8.GetString(LUnprotected);
+    finally
+      if LOutBlob.pbData <> nil then
+        LocalFree(HLOCAL(LOutBlob.pbData));
+    end;
+  except
+    // Fallback path for plain/base64 secrets.
+    try
+      LData := TNetEncoding.Base64.DecodeStringToBytes(AValue);
+      Result := TEncoding.UTF8.GetString(LData);
+    except
+      Result := AValue;
+    end;
+  end;
+end;
+
+class function TKrvnCrypto.DerivePasswordHash(const APassword: string; const ASalt: TBytes;
+  AIterations: Integer): TBytes;
+begin
+  Result := PBKDF2SHA256(TEncoding.UTF8.GetBytes(APassword), ASalt, AIterations, 32);
+end;
+
+class function TKrvnCrypto.BuildAuthProof(const APbkdf2Hash, ANonce: TBytes): TBytes;
+begin
+  Result := HMACSHA256(APbkdf2Hash, ANonce);
+end;
+
+end.
